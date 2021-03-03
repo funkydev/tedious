@@ -45,6 +45,7 @@ import depd from 'depd';
 import { MemoryCache } from 'adal-node';
 
 import AbortController from 'node-abort-controller';
+import { BulkLoadPayload } from './bulk-load-payload';
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const deprecate = depd('tedious');
@@ -2776,9 +2777,20 @@ class Connection extends EventEmitter {
   execBulkLoad(bulkLoad: BulkLoad) {
     bulkLoad.executionStarted = true;
 
+    // If the bulkload was not put into streaming mode by the user,
+    // we end the rowToPacketTransform here for them.
+    //
+    // If it was put into streaming mode, it's the user's responsibility
+    // to end the stream.
+    if (!bulkLoad.streamingMode) {
+      bulkLoad.rowToPacketTransform.end();
+    }
+
     const onCancel = () => {
       request.cancel();
     };
+
+    const payload = new BulkLoadPayload(bulkLoad);
 
     const request = new Request(bulkLoad.getBulkInsertSql(), (error: (Error & { code?: string }) | null | undefined) => {
       bulkLoad.removeListener('cancel', onCancel);
@@ -2792,7 +2804,7 @@ class Connection extends EventEmitter {
         return;
       }
 
-      this.makeRequest(bulkLoad, TYPE.BULK_LOAD);
+      this.makeRequest(bulkLoad, TYPE.BULK_LOAD, payload);
     });
 
     bulkLoad.once('cancel', onCancel);
@@ -3063,9 +3075,7 @@ class Connection extends EventEmitter {
   /**
    * @private
    */
-  makeRequest(request: BulkLoad, packetType: number): void
-  makeRequest(request: Request, packetType: number, payload: Iterable<Buffer> & { toString: (indent?: string) => string }): void
-  makeRequest(request: Request | BulkLoad, packetType: number, payload?: Iterable<Buffer> & { toString: (indent?: string) => string }) {
+  makeRequest(request: Request | BulkLoad, packetType: number, payload?: (Iterable<Buffer> | AsyncIterable<Buffer>) & { toString: (indent?: string) => string }) {
     if (this.state !== this.STATE.LOGGED_IN) {
       const message = 'Requests can only be made in the ' + this.STATE.LOGGED_IN.name + ' state, not the ' + this.state.name + ' state';
       this.debug.log(message);
@@ -3087,8 +3097,6 @@ class Connection extends EventEmitter {
       request.rows! = [];
       request.rst! = [];
 
-      let message: Message;
-
       const onCancel = () => {
         // set the ignore bit and end the message.
         message.ignore = true;
@@ -3107,37 +3115,30 @@ class Connection extends EventEmitter {
 
       this.createRequestTimer();
 
-      if (request instanceof BulkLoad) {
-        message = request.getMessageStream();
+      const message = new Message({ type: packetType, resetConnection: this.resetConnectionOnNextRequest });
+      this.messageIo.outgoingMessageStream.write(message);
+      this.transitionTo(this.STATE.SENT_CLIENT_REQUEST);
 
-        // If the bulkload was not put into streaming mode by the user,
-        // we end the rowToPacketTransform here for them.
-        //
-        // If it was put into streaming mode, it's the user's responsibility
-        // to end the stream.
-        if (!request.streamingMode) {
-          request.rowToPacketTransform.end();
-        }
-        this.messageIo.outgoingMessageStream.write(message);
-        this.transitionTo(this.STATE.SENT_CLIENT_REQUEST);
-      } else {
-        message = new Message({ type: packetType, resetConnection: this.resetConnectionOnNextRequest });
-        this.messageIo.outgoingMessageStream.write(message);
-        this.transitionTo(this.STATE.SENT_CLIENT_REQUEST);
+      message.once('finish', () => {
+        request.removeListener('cancel', onCancel);
 
-        message.once('finish', () => {
-          this.resetConnectionOnNextRequest = false;
-          this.debug.payload(function() {
-            return payload!.toString('  ');
-          });
+        this.resetConnectionOnNextRequest = false;
+        this.debug.payload(function() {
+          return payload!.toString('  ');
         });
+      });
 
-        Readable.from(payload!).pipe(message);
+      const payloadStream = Readable.from(payload!);
 
-        message.once('finish', () => {
-          request.removeListener('cancel', onCancel);
-        });
-      }
+      payloadStream.once('error', (error) => {
+        // Only set a request error if no error was set yet.
+        request.error ??= error;
+
+        message.ignore = true;
+        message.end();
+      });
+
+      payloadStream.pipe(message);
     }
   }
 
